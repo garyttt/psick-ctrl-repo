@@ -1,0 +1,370 @@
+# GitLab CI configuration - https://docs.gitlab.com/ce/ci/yaml/README.html
+# Example for a Puppet deployment workflow with Feature branches making
+# MR directly to production. (can be skipped by setting CI variable SKIP_MR=yes
+# Requires a fully configured Puppet-GitLab-CI runners
+# environment to work.
+# Without SKIP_MR=yes it expects Puppet code deployment to be done
+# automatically when changes are pushed to a branch via Code Manager,
+# r10k or similar.
+
+# Workaround for fatal: git fetch-pack: expected shallow list error
+# See: https://gitlab.com/gitlab-org/gitlab-foss/issues/60466
+variables:
+  GIT_STRATEGY: clone
+
+stages:
+  - merge request
+  - checks
+  - unit
+  - integration
+  - canary
+  - promote
+  - production runs
+  - documentation
+
+# Create WIP Merge request
+Create WIP MR:
+  stage: merge request
+  script:
+    - "bin/gitlab_create_merge_request.rb ${CI_BUILD_REF_NAME} production \"WIP: Works on ${CI_BUILD_REF_NAME}\"" 
+  when: on_success
+  tags:
+    - deploy_puppet
+  except:
+    refs:
+      - production
+      - schedules
+    variables:
+      - $SKIP_MR == "yes"
+  allow_failure: true
+
+# Run Syntax Checks on Feature/Personal Branch
+Syntax checks:
+  stage: checks
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+  script: "bin/puppet_check_syntax_fast.sh all_but_chars"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+  tags:
+    - test_puppet
+  except:
+    - production
+  only:
+    - branches
+
+Puppet Lint:
+  stage: checks
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+  script: "bin/puppet_lint.sh"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+  tags:
+    - test_puppet
+  except:
+    - production
+  only:
+    - branches
+  allow_failure: true
+
+Hidden chars check:
+  stage: checks
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+  script: "bin/puppet_check_syntax_fast.sh chars"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+  tags:
+    - test_puppet
+  except:
+    - production
+  only:
+    - branches
+  allow_failure: true
+
+Danger BOT:
+  stage: checks
+  before_script:
+    - "bin/gitlab_before.sh"
+  script: "bin/gitlab_danger.sh"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+  tags:
+    - deploy_puppet
+  except:
+    - production
+    - schedules
+  only:
+    - branches_disabled
+  allow_failure: true
+
+# Version Deploy check for every branch with environment creation
+# It will try by default 6 times with 10 second between each try
+# so that Puppet has time to get the new version of the repository
+Verify code deploy:
+  stage: checks
+  script: "bin/codemanager_check_deploy.sh ${CI_BUILD_REF_NAME}"
+  tags:
+    - deploy_puppet
+  when: on_success
+  allow_failure: true
+  environment:
+    name: ${CI_BUILD_REF_NAME}
+    url: https://puppet.lab.psick.io/
+
+# UNIT TESTS
+Local site modules:
+  stage: unit
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+  script:
+    - "bin/puppet_check_rake.sh site bundle"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+    - vagrant/environments/ci/.vagrant/
+  tags:
+    - test_puppet
+  except:
+    - production
+  only:
+    - branches
+  allow_failure: true
+
+control-repo:
+  stage: unit
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+  script:
+    - "bin/puppet_check_rake.sh controlrepo"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+    - vagrant/environments/ci/.vagrant/
+  tags:
+    - test_puppet
+  except:
+    - production
+  only:
+    - branches
+  allow_failure: true
+
+Public modules:
+  stage: unit
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+  script:
+    - "bin/puppet_check_rake.sh modules bundle"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+    - vagrant/environments/ci/.vagrant/
+  tags:
+    - test_puppet
+  except:
+    - production
+  only:
+    - branches
+  allow_failure: true
+  when: manual
+
+Catalog preview:
+  stage: integration
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+  script: "bin/gitlab_catalog_preview.sh ${CI_BUILD_REF_NAME}"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+  tags:
+    - deploy_puppet
+  allow_failure: true
+  except:
+    - production
+  when: manual
+
+# Can be duplicated to use different images (using different --image)
+# or with custom facts --facts. Check docker_run.sh for all the options.
+Docker tests:
+  stage: integration
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+  script: "bin/docker_run.sh --image centos-7"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+  allow_failure: true
+  tags:
+    - test_puppet
+  only:
+    - schedules
+    - branches
+  except:
+    - production
+  when: manual
+
+Beaker tests:
+  stage: integration
+  before_script:
+    - "bin/gitlab_before.sh ${CI_BUILD_REF_NAME}"
+    - "/opt/puppetlabs/puppet/bin/bundle install --with=integration --path=vendor"
+  script: "/opt/puppetlabs/puppet/bin/rake beaker_roles:psick"
+  cache:
+    untracked: true
+    paths:
+    - modules/
+  allow_failure: true
+  tags:
+    - test_puppet
+  except:
+    - production
+  when: manual
+  only:
+    - schedules
+    - branches
+
+Canary no-noop runs:
+  stage: canary
+  before_script:
+    - "bin/puppet_ci.sh job_run --no-noop --environment ${CI_BUILD_REF_NAME} --description '[CI] Canary no-noop run with ${CI_BUILD_REF_NAME}'"
+  script:
+    - "bin/puppetdb_env_query.sh ${CI_BUILD_REF_NAME}"
+  tags:
+    - deploy_puppet
+  when: manual
+  only:
+    - branches
+    - schedules
+  except:
+    - production
+  allow_failure: true
+
+Canary noop runs:
+  stage: canary
+  before_script:
+    - "bin/puppet_ci.sh job_run --noop --environment ${CI_BUILD_REF_NAME} --description '[CI] Canary noop run with ${CI_BUILD_REF_NAME}'"
+  script:
+    - "bin/puppetdb_env_query.sh ${CI_BUILD_REF_NAME}"
+  tags:
+    - deploy_puppet
+  when: on_success
+  only:
+    - branches
+    - schedules
+  except:
+    - production
+  allow_failure: true
+
+Accept MR:
+  stage: promote
+  script: "bin/gitlab_accept_merge_request.rb ${CI_BUILD_REF_NAME} production"
+  tags:
+    - deploy_puppet
+  when: manual
+  except:
+    refs:
+      - production
+    variables:
+      - $SKIP_MR == "yes"
+  allow_failure: true
+  only:
+    - branches_disabled
+
+# Production Rollout
+Trigger noop runs:
+  stage: production runs
+  before_script:
+    - "bin/puppet_ci.sh job_run --noop --environment production --description '[CI] Production noop run'"
+  script: "bin/puppetdb_env_query.sh production"
+  tags:
+    - deploy_puppet
+  when: on_success
+  only:
+    - production
+  allow_failure: true # TOREMOVE when fixed
+
+Trigger no_noop runs:
+  stage: production runs
+  before_script:
+    - "bin/puppet_ci.sh job_run --no-noop --environment production --description '[CI] Production no-noop run'"
+  script: "bin/puppetdb_env_query.sh production"
+  tags:
+    - deploy_puppet
+  when: manual
+  only:
+    - production
+  allow_failure: true # TOREMOVE when fixed
+
+# Documentation
+control-repo docs:
+  stage: documentation
+  before_script:
+    - rm -rf doc public .yardoc README.md
+    - bin/docs_classlistgenerate.sh site/profile docs/classes.md
+    - for f in $(cat docs/toc.txt); do cat docs/$f >> README.md ; echo >> README.md ; done
+    - bin/gitlab_before.sh
+  script:
+    - puppet strings generate site/**/**/*{.pp\,.rb} site/**/**/**/*{.pp\,.rb} modules/psick/**/*{.pp\,.rb} modules/psick/**/**/*{.pp\,.rb} modules/psick/**/**/**/*{.pp\,.rb} manifests/site.pp
+    - mv doc public
+  tags:
+    - deploy_puppet
+  artifacts:
+    paths:
+    - public
+    expire_in: '30 day'
+  only:
+    - production
+
+modules docs:
+  stage: documentation
+  before_script:
+    - bin/gitlab_before.sh
+    - rm -f README.md
+    - bin/docs_classlistgenerate.sh modules docs/classes_modules.md
+    - for f in $(cat docs/toc-modules.txt); do cat docs/$f >> README.md ; done
+    - bin/gitlab_before.sh
+  script:
+    - puppet strings generate modules/**/**/*{.pp\,.rb} modules/**/**/**/*{.pp\,.rb}
+    # - rake strings:generate["modules/**/**/*{.pp\,.rb} modules/**/**/**/*{.pp\,.rb}, false, false, markdown,-r docs/PsickGuide.md"]
+    - mv doc public/modules
+  tags:
+    - deploy_puppet
+  artifacts:
+    paths:
+    - public
+    expire_in: '30 day'
+  when: manual
+  only:
+    - production
+
+Generate pdf:
+  stage: documentation
+  before_script:
+    - bin/docs_classlistgenerate.sh docs/classes.md
+    - mkdir public
+    - for f in $(cat docs/toc.txt); do cat docs/$f >> public/PsickGuide.md ; done
+  script:
+    - docker run -v $(pwd):/puppet -i jagregory/pandoc -f markdown /puppet/public/PsickGuide.md -o /puppet/public/PsickGuide.pdf --latex-engine=xelatex -s  --toc -V geometry:margin=2cm
+  tags:
+    - test_puppet
+  artifacts:
+    paths:
+    - public
+    expire_in: '30 day'
+  only:
+    - production
+
